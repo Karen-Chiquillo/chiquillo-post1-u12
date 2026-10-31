@@ -90,6 +90,41 @@ Además, Maven Surefire solo ejecuta por defecto las clases que terminan en `Tes
 
 ---
 
+## Qué se descartó y por qué
+
+Cada elemento se evaluó con la pregunta de la Guía (sección 4.2): ¿la variabilidad que justificaría la alternativa es real y está documentada hoy, o es especulación sobre un futuro que todavía no llegó? Ninguno es un descarte definitivo: cada uno dice qué señal haría reconsiderarlo.
+
+### Ejemplos de referencia del enunciado
+
+**1. `ApplicationEventPublisher` en lugar de una lista de observadores inyectada.**
+- *Qué se consideró:* publicar un evento de dominio con `ApplicationEventPublisher` y recibirlo con `@EventListener` (Guía, sección 2.3), en lugar de inyectar `List<ObservadorCambioEstado>` en el servicio.
+- *Por qué se descartó:* con tres observadores fijos y conocidos al compilar, un bus de eventos genérico no agrega desacoplamiento, porque la interfaz `ObservadorCambioEstado` ya lo da, y sí hace más difícil rastrear en el código quién reacciona a qué cambio (el costo de trazabilidad que la Guía 6.2 atribuye a Observer con eventos).
+- *Señal para reconsiderarlo:* la integración de Contabilidad por API externa. ADR-001 deja como condición que esa reacción ocurra después del commit, y `@TransactionalEventListener(phase = AFTER_COMMIT)` es la forma estándar de hacerlo en Spring; si ese es el mecanismo que se elige, los eventos pasan a resolver un problema real.
+
+**2. Visitor o Abstract Factory para exportar reportes en varios formatos.**
+- *Qué se consideró:* anticipar que Contabilidad pediría exportar el historial en PDF y en Excel, y construir desde ahora una jerarquía de exportadores.
+- *Por qué se descartó:* en este proyecto ni siquiera existe todavía un requisito de exportación; mucho menos un segundo formato. No se cumple la Rule of Three (Guía 4.2): sería resolver un problema que no existe (YAGNI).
+- *Señal para reconsiderarlo:* una segunda solicitud real de formato. Con dos se tolera la duplicación; con la tercera se abstrae.
+
+### Elementos propios, surgidos durante la implementación
+
+**3. Patrón State para los estados de la solicitud.**
+- *Qué se consideró:* al agregar la regla que impide aprobar dos veces (Desviación 6) apareció la idea de modelar cada estado como una clase (`EstadoPendiente`, `EstadoAprobada`, …) con su propio método `cambiarA(...)`, como enseña el patrón State.
+- *Por qué se descartó:* hoy solo hay una regla de transición ("solo una solicitud `PENDIENTE` se puede resolver") y ningún estado tiene comportamiento propio aparte de esa regla. State convertiría un `if` de una línea en `SolicitudReembolso.cambiarEstado()` en una interfaz y cuatro clases. No pasa el test de explicabilidad (Guía 1.2): no se puede decir en una oración qué aporta State que no aporte ese `if` (KISS).
+- *Señal para reconsiderarlo:* que los estados empiecen a comportarse distinto. Por ejemplo, que `REQUIERE_CORRECCION` permita al empleado editar y reenviar la solicitud, o que aparezcan estados como `EN_REVISION` o `PAGADA` con reglas propias. Con tres o más estados que tengan lógica distinta, State sí paga su costo.
+
+**4. Entidad JPA separada con un mapper (`SolicitudReembolsoEntity` + `SolicitudMapper`).**
+- *Qué se consideró:* para sacar JPA del dominio (Desviación 1), la solución que muestra la Guía de la Unidad 7 es una clase `@Entity` en infraestructura y un mapper que copie los datos entre ella y el objeto de dominio.
+- *Por qué se descartó:* el modelo de persistencia y el de dominio son idénticos (los mismos nueve campos). La entidad duplicaría la clase completa y el mapper copiaría campo por campo en las dos direcciones, código que hay que mantener sincronizado sin que agregue nada. `META-INF/orm.xml` logra el mismo aislamiento con cero clases nuevas. Hay una sola forma de persistir, y la Rule of Three dice que no se abstrae con un solo caso: no existe nada que justifique la traducción (YAGNI).
+- *Señal para reconsiderarlo:* que la tabla deje de parecerse a la clase, por ejemplo con columnas de auditoría, versionado optimista o una tabla aparte para los documentos soporte; o que llegue el cambio de motor que ADR-001 deja como señal para introducir el puerto de persistencia.
+
+**5. Armar la cadena automáticamente con `List<ValidadorSolicitud>` y `@Order`.**
+- *Qué se consideró:* que `CadenaValidadores` recibiera todos los validadores como lista (igual que `SelectorCalculadora`) y los ordenara con `@Order(1)`, `@Order(2)`, `@Order(3)` en cada clase. Así, agregar el "límite anual acumulado" no tocaría `CadenaValidadores`.
+- *Por qué se descartó:* el orden de la cadena es una decisión de diseño con justificación propia (Decisión 1), y con `@Order` quedaría repartido en tres archivos distintos como números sueltos, sin un lugar donde leerlo completo. Hoy el orden se lee en una sola línea del constructor (`documentos.siguiente(monto).siguiente(duplicados)`). Con tres validadores, el costo de agregar el cuarto es esa misma línea; la indirección no se paga todavía (Rule of Three).
+- *Señal para reconsiderarlo:* cuando la cadena llegue a cinco o seis eslabones, o cuando haya validadores que se activen según la configuración (por ejemplo, solo para ciertas sedes). Ahí sí conviene que cada eslabón declare su posición.
+
+---
+
 ## Desviaciones respecto al código de referencia
 
 El enunciado trae código de referencia para cada paso. Al implementarlo y probarlo aparecieron problemas concretos; cada uno se corrigió y queda verificado por una prueba.
