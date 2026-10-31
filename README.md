@@ -70,6 +70,24 @@ RF1 rechaza una solicitud cuyo monto supere "el tope de la categoría" y RF2 usa
 
 **Ajuste propio respecto a la guía:** el selector de referencia usa `Collectors.toMap` y un `orElseThrow` en `obtener()`, de modo que una categoría sin calculadora solo falla cuando llega una solicitud de esa categoría. Además, las tres calculadoras leen el tope con `solicitud.topeAplicable()`, que viene de `CategoriaGasto`, en lugar de guardar sus propias constantes `TOPE_DIARIO`, `TOPE_MENSUAL` y `TOPE_ANUAL`: es el mismo número que usa `ValidadorMontoMaximo`, como se explicó en el Diseño Propuesto.
 
+### Decisión de diseño 4 — Qué prohíbe la Regla 1 de ArchUnit
+
+**Decisión:** la regla `procesamientoSinPersistenciaNiWeb` prohíbe que `procesamiento/` dependa de `..infraestructura..`, `..adaptadores..`, `org.springframework.data..` y `jakarta.persistence..`, pero **no** de todo `org.springframework`. **Alternativa descartada:** prohibir cualquier dependencia de `org.springframework..` en ese paquete.
+
+**Justificación:** (1) la regla tiene que proteger lo que de verdad acopla: lo que haría que un validador, una calculadora o un notificador dependa de **cómo** se guardan los datos o de **cómo** llegan las peticiones. `@Component` no hace eso: es una marca que le dice a Spring "crea una instancia de esta clase"; no cambia lo que la clase hace, y si mañana se quita, la lógica sigue igual y las pruebas unitarias (que crean los validadores con `new`) no se enteran. Un `JpaRepository` o un `HttpServletRequest`, en cambio, meten la base de datos o HTTP dentro de la regla de negocio. (2) Prohibir todo `org.springframework` obligaría a quitar `@Component` y registrar cada eslabón, cada calculadora y cada notificador con `@Bean` en una clase `@Configuration`; con eso se perdería justamente lo que sostiene la Decisión 2, que una categoría nueva entre como una clase nueva sin tocar ningún otro archivo. (3) Las dependencias de Spring que sí se usan en `procesamiento/` son solo `org.springframework.stereotype.Component`, y el logger es SLF4J, no Spring; la regla deja pasar exactamente eso y nada más del acceso a datos.
+
+**Lo que se sacrifica:** `procesamiento/` no es 100 % independiente del framework: llevarlo a otro contenedor de inyección exigiría quitar las anotaciones. Se acepta porque no hay ningún plan de cambiar Spring (ADR-001) y la lógica en sí ya se prueba sin levantar Spring.
+
+**Ajustes propios a las reglas de la guía:** las cuatro reglas se ejecutaron primero tal como vienen en el enunciado y **tres fallaron**, sin que hubiera una violación real de arquitectura:
+
+| Regla | Por qué falló tal cual | Ajuste |
+|-------|------------------------|--------|
+| 3 y 4 | `@AnalyzeClasses` también importa las clases de prueba, y estas viven en los mismos paquetes (`CalculadoraViajeTest` está en `procesamiento.calculo`), así que la regla exigía que los tests implementaran las interfaces. | `importOptions = ImportOption.DoNotIncludeTests.class`. |
+| 3 | `SelectorCalculadora` está en `procesamiento.calculo` (el mismo lugar que le da la guía) y no implementa `CalculadoraReembolso`, porque no es una estrategia sino quien las elige. | La regla aplica a las clases cuyo nombre empieza por `Calculadora`. Se mantiene el selector junto a las calculadoras por el Common Closure Principle (Guía 3.2: lo que cambia junto va junto). |
+| 2 | `onlyAccessClassesThat` cuenta como acceso que una clase use sus propios campos; el constructor del controlador asigna `this.servicio`, y `adaptadores.rest` no estaba en la lista permitida, así que fallaba incluso con el controlador de la guía. Además, `ManejadorErrores` lee los errores con `org.springframework.validation.BindingResult`. | Se agregan `..adaptadores.rest..` (sus propios DTOs) y `org.springframework.validation..`. La regla sigue impidiendo lo importante: que el adaptador llame a `procesamiento` o a `infraestructura` saltándose el servicio. |
+
+Además, Maven Surefire solo ejecuta por defecto las clases que terminan en `Test` o `Tests`, y `ReglasArquitectura` (el nombre que pide el enunciado) no cumple ese patrón: `mvn verify` nunca ejecutaba las reglas. Se agregó al `<includes>` del plugin en el `pom.xml`, y ahora `mvn verify` corre 49 pruebas (45 + 4 reglas).
+
 ---
 
 ## Desviaciones respecto al código de referencia
