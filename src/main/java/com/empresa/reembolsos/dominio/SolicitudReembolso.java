@@ -107,4 +107,15 @@ public class SolicitudReembolso {
     public BigDecimal topeAplicable() {
         return categoria.topePara(diasViaje);
     }
+
+    /**
+     * Resuelve una solicitud pendiente. Una solicitud ya resuelta no se puede volver a cambiar:
+     * aprobarla dos veces haria que Contabilidad programara el pago dos veces.
+     */
+    public void cambiarEstado(EstadoSolicitud nuevoEstado) {
+        if (estado != EstadoSolicitud.PENDIENTE || nuevoEstado == EstadoSolicitud.PENDIENTE) {
+            throw new TransicionEstadoInvalidaException(estado, nuevoEstado);
+        }
+        this.estado = nuevoEstado;
+    }
 }
