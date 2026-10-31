@@ -40,3 +40,22 @@ RF1 rechaza una solicitud cuyo monto supere "el tope de la categoría" y RF2 usa
 ### Modelo de dominio
 
 `SolicitudReembolso`, `CategoriaGasto` y `EstadoSolicitud` están en `dominio/` y no importan ninguna clase de Spring ni de JPA. El mapeo de la solicitud a una tabla se hará fuera del dominio, en `infraestructura/`, cuando se implemente la persistencia.
+
+---
+
+## Decisiones de diseño
+
+### Decisión de diseño 1 — Orden de la cadena de validadores
+
+**Decisión:** `CadenaValidadores` enlaza los eslabones en el orden documentos → monto → duplicados, dejando al final el más caro. **Alternativa descartada:** poner `ValidadorDuplicados` primero.
+
+**Criterio:** ordenar por costo de ejecución, de menor a mayor. `ValidadorDocumentosSoporte` solo lee un `boolean` de la solicitud; `ValidadorMontoMaximo` compara el monto contra el tope del dominio (en viajes, una multiplicación); `ValidadorDuplicados` necesita las solicitudes pendientes del empleado, es decir, una consulta a la base de datos.
+
+| Orden | Qué se gana | Qué se pierde |
+|-------|-------------|---------------|
+| **Duplicados al final (elegido)** | Una solicitud sin documentos o con monto excesivo se rechaza sin consultar la base de datos. | Si una solicitud tiene varios problemas, el empleado se entera de uno a la vez: corrige los documentos, la reenvía y recién ahí descubre que estaba duplicada. |
+| Duplicados primero | El empleado sabe de entrada que la solicitud sobra, antes de buscar documentos que no le van a servir. | Toda solicitud paga la consulta, incluso las que se iban a rechazar por algo que se sabía sin consultar nada. |
+
+**Justificación:** (1) los dos primeros eslabones son verificaciones en memoria y descartan solicitudes sin costo, así que tiene sentido que filtren antes del eslabón que va a la base de datos; (2) el caso "duplicada y además mal diligenciada" es el menos frecuente, porque el empleado normalmente sabe si ya envió algo ese mes, mientras que olvidar un documento o pasarse del tope son errores comunes; (3) el orden es fácil de revertir: está en tres líneas del constructor de `CadenaValidadores` y ningún validador depende de su posición.
+
+**Ajuste propio respecto a la guía:** en el código de referencia el servicio carga las pendientes **antes** de entrar a la cadena (`findByEmpleadoIdAndEstado` y luego `validadores.validar(...)`), así que la consulta se hace siempre y el orden de los eslabones no ahorra nada. Para que el criterio de eficiencia tenga efecto real, `ValidadorSolicitud.validar` recibe un `Supplier<List<SolicitudReembolso>>` en vez de la lista ya cargada, y solo `ValidadorDuplicados` llama a `get()`. `CadenaValidadoresTest` lo comprueba contando las consultas: 0 cuando falla documentos, 0 cuando falla monto y 1 cuando la solicitud llega al último eslabón.
