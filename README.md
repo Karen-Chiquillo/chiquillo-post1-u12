@@ -70,6 +70,12 @@ RF1 rechaza una solicitud cuyo monto supere "el tope de la categoría" y RF2 usa
 
 **Ajuste propio respecto a la guía:** el selector de referencia usa `Collectors.toMap` y un `orElseThrow` en `obtener()`, de modo que una categoría sin calculadora solo falla cuando llega una solicitud de esa categoría. Además, las tres calculadoras leen el tope con `solicitud.topeAplicable()`, que viene de `CategoriaGasto`, en lugar de guardar sus propias constantes `TOPE_DIARIO`, `TOPE_MENSUAL` y `TOPE_ANUAL`: es el mismo número que usa `ValidadorMontoMaximo`, como se explicó en el Diseño Propuesto.
 
+### Decisión de diseño 3 — Capas simples o Hexagonal (documentada en ADR-001)
+
+**Decisión:** se mantiene la arquitectura en capas simples. `SolicitudReembolsoService` sigue dependiendo directamente de `RepositorioSolicitudesJpa`, sin un puerto `RepositorioSolicitudes`, y el paquete `procesamiento.notificacion` no cambia su estructura. **Alternativas descartadas:** un puerto solo para la persistencia (B) y la arquitectura Hexagonal completa (C). La evaluación completa está en [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md) y su resumen, más abajo.
+
+**Justificación:** el criterio de la Guía (6.2) se evaluó por separado para cada dependencia externa, y la respuesta es distinta para cada una. (1) **Persistencia:** no se cumple. No hay un cambio de motor previsto, y el beneficio principal de Hexagonal (un dominio sin JPA) ya existe gracias al `orm.xml`; un puerto sería una interfaz con un único implementador que reenvía tres métodos. (2) **Notificación:** aquí sí hay un cambio de infraestructura con fecha (la API de Contabilidad del próximo trimestre), pero `ObservadorCambioEstado` ya funciona como puerto: el cambio queda dentro de `NotificadorContabilidad`, sin tocar el servicio ni los otros dos observadores. Lo que sí deja el ADR es una condición para esa integración: reaccionar después del commit de la transacción.
+
 ### Decisión de diseño 4 — Qué prohíbe la Regla 1 de ArchUnit
 
 **Decisión:** la regla `procesamientoSinPersistenciaNiWeb` prohíbe que `procesamiento/` dependa de `..infraestructura..`, `..adaptadores..`, `org.springframework.data..` y `jakarta.persistence..`, pero **no** de todo `org.springframework`. **Alternativa descartada:** prohibir cualquier dependencia de `org.springframework..` en ese paquete.
@@ -87,6 +93,30 @@ RF1 rechaza una solicitud cuyo monto supere "el tope de la categoría" y RF2 usa
 | 2 | `onlyAccessClassesThat` cuenta como acceso que una clase use sus propios campos; el constructor del controlador asigna `this.servicio`, y `adaptadores.rest` no estaba en la lista permitida, así que fallaba incluso con el controlador de la guía. Además, `ManejadorErrores` lee los errores con `org.springframework.validation.BindingResult`. | Se agregan `..adaptadores.rest..` (sus propios DTOs) y `org.springframework.validation..`. La regla sigue impidiendo lo importante: que el adaptador llame a `procesamiento` o a `infraestructura` saltándose el servicio. |
 
 Además, Maven Surefire solo ejecuta por defecto las clases que terminan en `Test` o `Tests`, y `ReglasArquitectura` (el nombre que pide el enunciado) no cumple ese patrón: `mvn verify` nunca ejecutaba las reglas. Se agregó al `<includes>` del plugin en el `pom.xml`, y ahora `mvn verify` corre 49 pruebas (45 + 4 reglas).
+
+---
+
+## Resumen de ADR-001
+
+**ADR-001: Capas simples para la persistencia; el seam de notificación ya cubre el próximo cambio conocido.** Estado: Aceptado — 2026-10-31. Documento completo: [`docs/adr/ADR-001.md`](docs/adr/ADR-001.md).
+
+| Alternativa | Persistencia | Notificación | Resultado |
+|-------------|--------------|--------------|-----------|
+| **A. No cambiar nada (capas simples)** | El servicio usa `RepositorioSolicitudesJpa` | `ObservadorCambioEstado` como punto de extensión | **Elegida** |
+| B. Puerto solo para persistencia | Interfaz `RepositorioSolicitudes` + adaptador JPA | Igual que A | Descartada: un solo implementador que reenvía 3 métodos (YAGNI) |
+| C. Hexagonal completa | Igual que B | Puerto `ProgramadorPagos` y casos de uso como puertos de entrada | Descartada: una segunda abstracción encima de la que ya existe |
+
+**Datos del proyecto que sostienen la decisión.** Las métricas de acoplamiento de la Guía (sección 3.1) se calcularon con `jdeps` sobre las clases compiladas, contando clases de este proyecto (CA: clases de otros paquetes que dependen del paquete; CE: clases de otros paquetes de las que el paquete depende; I = CE / (CA + CE)):
+
+| Paquete | CA | CE | I | Lectura |
+|---------|----|----|---|---------|
+| `dominio` | 20 | 0 | 0.00 | Totalmente estable: todo depende de él y él no depende de nadie, ni siquiera de JPA. Es la propiedad que Hexagonal busca y que ya se tiene. |
+| `procesamiento` | 1 | 3 | 0.75 | Solo lo usa el servicio, y solo depende del dominio. Tiene 3 abstracciones de 15 tipos (A = 0.20), así que A + I = 0.95 queda cerca de la secuencia principal (A + I = 1). |
+| `aplicacion` | 2 | 9 | 0.82 | El punto que coordina todo: es normal que dependa de varios paquetes. |
+| `infraestructura` | 1 | 2 | 0.67 | **Una sola clase depende de ella** (`SolicitudReembolsoService`). Si algún día hace falta el puerto, el cambio se limita a esa clase: la deuda que acepta el ADR está acotada. |
+| `adaptadores` | 0 | 7 | 1.00 | Capa de entrada: nadie depende de ella, que es lo esperado. |
+
+**Consecuencias principales.** Positivas: no se agregan interfaces ni adaptadores sin un caso de uso real; el único cambio de infraestructura con fecha afecta a una sola clase; el dominio ya es Java puro. Negativas: un cambio de motor obligaría a introducir el puerto después (deuda deliberada y prudente); las pruebas del servicio pasan por H2 con `@SpringBootTest`; y como los observadores corren dentro de la transacción de `cambiarEstado`, una falla de la futura API de Contabilidad revertiría el cambio de estado después de que Auditoría ya lo registró. Por eso el ADR deja como condición que esa integración reaccione después del commit (`@TransactionalEventListener(phase = AFTER_COMMIT)` o `TransactionSynchronization`).
 
 ---
 
@@ -127,7 +157,7 @@ Cada elemento se evaluó con la pregunta de la Guía (sección 4.2): ¿la variab
 
 ## Desviaciones respecto al código de referencia
 
-El enunciado trae código de referencia para cada paso. Al implementarlo y probarlo aparecieron problemas concretos; cada uno se corrigió y queda verificado por una prueba.
+El enunciado trae código de referencia para cada paso. Al implementarlo y probarlo aparecieron problemas concretos; cada uno se corrigió y queda verificado por una prueba o por una evidencia del pipeline. Las filas 1 a 8 son de la Parte 1 y las 9 a 12 de la Parte 2.
 
 | # | Qué hacía el código de referencia | Problema concreto | Qué se hizo | Dónde se comprueba |
 |---|-----------------------------------|-------------------|-------------|--------------------|
@@ -139,6 +169,10 @@ El enunciado trae código de referencia para cada paso. Al implementarlo y proba
 | 6 | `cambiarEstado` aceptaba cualquier transición | Una solicitud se podía aprobar dos veces, y cada aprobación hace que Contabilidad programe el pago. | `SolicitudReembolso.cambiarEstado()` solo permite resolver una solicitud `PENDIENTE`; si no, lanza `TransicionEstadoInvalidaException` (409). | `SolicitudReembolsoTest`, `cambiarEstado_aprobarDosVeces...` y captura 09. |
 | 7 | Dos notificadores con `System.out.println` y uno con `Logger` | Era inconsistente, y SonarQube marca `System.out` como code smell (Unidad 10). | Los tres usan SLF4J. | `NotificadoresTest` y captura 04. |
 | 8 | `SelectorCalculadora` fallaba con la primera solicitud de una categoría sin calculadora | El error aparecía en producción, con un empleado esperando. | Verificación al construir el selector. | `SelectorCalculadoraTest` (Decisión 2). |
+| 9 | Las 4 reglas de `ReglasArquitectura` | Tal cual, 3 de las 4 fallaban sin ninguna violación real: analizaban las clases de prueba, la Regla 2 no permitía que el adaptador usara sus propios campos y la Regla 3 chocaba con `SelectorCalculadora`. | `DoNotIncludeTests`, paquete propio permitido en la Regla 2 y prefijo `Calculadora` en la Regla 3. | Decisión 4 y captura 01 de la Parte 2. |
+| 10 | El nombre `ReglasArquitectura` con la configuración por defecto de Maven | Surefire solo ejecuta clases terminadas en `Test`/`Tests`, así que `mvn verify` nunca corría las reglas. | `<includes>` de Surefire en el `pom.xml`. | `mvn verify` ejecuta 49 pruebas. |
+| 11 | Violación intencional "importar `RepositorioSolicitudesJpa` en `ValidadorDuplicados`" | ArchUnit lee el bytecode y un `import` sin uso no queda en él: el pipeline no habría fallado. | Un campo de tipo `RepositorioSolicitudesJpa`. | Capturas 03 y 05 de la Parte 2. |
+| 12 | Workflow con `actions/cache@v3` | Es la versión mayor anterior de la acción; la vigente es v4, la misma generación que `checkout@v4` y `setup-java@v4` que ya usa el workflow. | `actions/cache@v4` y `mvn -B` (modo batch) para logs legibles. | Capturas 02 y 04 de la Parte 2. |
 
 **Limitación conocida:** RF2 habla de un tope **mensual** para representación y un tope **anual** para capacitación. Igual que el código de referencia, el sistema aplica esos topes por solicitud y no acumula lo que el empleado ya pidió en el mes o en el año. El lugar natural para resolverlo es un cuarto eslabón de la cadena (RF1 ya anuncia "un límite anual acumulado por empleado"), que se agregaría sin tocar los tres validadores actuales.
 
@@ -158,13 +192,40 @@ El proyecto está organizado en capas, con un paquete `procesamiento/` que agrup
 | `infraestructura/` | `RepositorioSolicitudesJpa` (Spring Data) + `META-INF/orm.xml` | `dominio` |
 | `adaptadores/rest/` | Controlador, DTOs y manejo de errores HTTP | `aplicacion`, `dominio` |
 
+Diagrama de componentes (nivel 3 del modelo C4, Guía 12 sección 6.3), donde se ve cada patrón como un componente y el servicio como único punto de coordinación:
+
+```mermaid
+flowchart LR
+    cliente(["Cliente HTTP"]) --> ctrl["SolicitudReembolsoController<br/>adaptadores.rest"]
+    ctrl --> svc["SolicitudReembolsoService<br/>aplicacion"]
+    svc --> cadena["CadenaValidadores<br/>RF1: Chain of Responsibility"]
+    svc --> selector["SelectorCalculadora<br/>RF2: Strategy"]
+    svc --> obs["ObservadorCambioEstado x3<br/>RF3: Observer"]
+    svc --> repo["RepositorioSolicitudesJpa<br/>infraestructura + orm.xml"]
+    repo --> h2[("H2")]
+    cadena --> dom["dominio<br/>SolicitudReembolso, CategoriaGasto"]
+    selector --> dom
+    obs --> dom
+    repo --> dom
+```
+
+Estos límites no dependen de la disciplina de quien programe: las reglas 1 y 2 de `ReglasArquitectura` los verifican en cada push con GitHub Actions, y el historial del pipeline muestra que una violación hace fallar el build (evidencias de la Parte 2).
+
 ```text
 chiquillo-post1-u12/
 ├── README.md
-├── pom.xml
+├── pom.xml                                ← Incluye ArchUnit y Surefire con ReglasArquitectura
 ├── mvnw / mvnw.cmd
+├── .mvn/wrapper/
+│   └── maven-wrapper.properties           ← Versión de Maven que usa el wrapper
+├── .gitignore
+├── .github/workflows/
+│   └── arquitectura.yml                   ← Pipeline: reglas ArchUnit + mvn verify
+├── docs/adr/
+│   └── ADR-001.md                         ← Decisión de diseño 3
 ├── screenshots/
-│   └── p1/                                ← Evidencias Parte 1
+│   ├── p1/                                ← Evidencias Parte 1
+│   └── p2/                                ← Evidencias Parte 2
 └── src/
     ├── main/
     │   ├── java/com/empresa/reembolsos/
@@ -208,7 +269,25 @@ chiquillo-post1-u12/
     │   └── resources/
     │       ├── application.properties
     │       └── META-INF/orm.xml           ← Mapeo JPA fuera del dominio
-    └── test/java/com/empresa/reembolsos/  ← Pruebas unitarias y de integración
+    └── test/java/com/empresa/reembolsos/  ← Mismos paquetes que main
+        ├── dominio/
+        │   └── SolicitudReembolsoTest.java
+        ├── procesamiento/
+        │   ├── validacion/
+        │   │   ├── ValidadorDocumentosSoporteTest.java
+        │   │   ├── ValidadorMontoMaximoTest.java
+        │   │   ├── ValidadorDuplicadosTest.java
+        │   │   └── CadenaValidadoresTest.java
+        │   ├── calculo/
+        │   │   ├── CalculadoraViajeTest.java
+        │   │   ├── CalculadoraRepresentacionTest.java
+        │   │   ├── CalculadoraCapacitacionTest.java
+        │   │   └── SelectorCalculadoraTest.java
+        │   └── notificacion/
+        │       └── NotificadoresTest.java
+        ├── FlujoSolicitudReembolsoIntegracionTest.java  ← @SpringBootTest del flujo completo
+        ├── ReembolsosApplicationTests.java
+        └── ReglasArquitectura.java        ← 4 reglas ArchUnit (Parte 2)
 ```
 
 ### Endpoints
@@ -244,11 +323,17 @@ curl -i -X POST localhost:8080/api/solicitudes -H "Content-Type: application/jso
 curl -i -X PUT localhost:8080/api/solicitudes/1/estado -H "Content-Type: application/json" -d '"APROBADA"'
 ```
 
+Solo las reglas de arquitectura (lo mismo que ejecuta el primer paso del pipeline):
+
+```bash
+mvn test -Dtest=ReglasArquitectura
+```
+
 ---
 
 ## Pruebas
 
-`mvn test` ejecuta **45 pruebas**: 36 unitarias sin levantar el contexto de Spring, 8 de integración con `@SpringBootTest` y la de arranque del contexto.
+`mvn verify` ejecuta **49 pruebas**: 36 unitarias sin levantar el contexto de Spring, 8 de integración con `@SpringBootTest`, la de arranque del contexto y las 4 reglas de arquitectura de la Parte 2. Al cerrar la Parte 1 eran 45 (captura 10 de la Parte 1).
 
 | Clase | Tipo | Pruebas | Qué verifica |
 |-------|------|---------|--------------|
@@ -264,6 +349,7 @@ curl -i -X PUT localhost:8080/api/solicitudes/1/estado -H "Content-Type: applica
 | `SolicitudReembolsoTest` | Unitaria | 6 | Transiciones válidas e inválidas; tope aplicable en viaje |
 | `FlujoSolicitudReembolsoIntegracionTest` | Integración (`@SpringBootTest`) | 8 | Flujo completo HTTP → servicio → patrones → H2 para las tres categorías, rechazos, notificación y 409 |
 | `ReembolsosApplicationTests` | Integración | 1 | El contexto de Spring arranca |
+| `ReglasArquitectura` | Arquitectura (ArchUnit) | 4 | `procesamientoSinPersistenciaNiWeb`, `controladorSoloUsaServicio`, `calculadorasImplementanInterfaz`, `notificadoresImplementanInterfaz` |
 
 ---
 
@@ -295,14 +381,40 @@ curl -i -X PUT localhost:8080/api/solicitudes/1/estado -H "Content-Type: applica
 
 ---
 
+## Evidencias de pruebas — Parte 2
+
+La violación intencional se hizo agregando a `ValidadorDuplicados` un campo de tipo `RepositorioSolicitudesJpa`. La guía propone solo importar la clase, pero ArchUnit analiza el bytecode compilado y un `import` que no se usa no queda en él, así que no habría hecho fallar el pipeline. Se usó un campo y no un parámetro del constructor para que el build fallara por la regla de arquitectura y no por un error de compilación en `CadenaValidadoresTest`.
+
+| # | Prueba | Resultado |
+|---|--------|-----------|
+| 0 | Repositorio público `chiquillo-post1-u12` al cerrar la Parte 1 | Proyecto en la raíz, 6 commits |
+| 1 | `mvn test -Dtest=ReglasArquitectura` en local | 4 pruebas, 0 fallos |
+| 2 | Primera ejecución del workflow `Validacion Arquitectonica` (commit `a42ed5c`) | Verde: 4 reglas y `mvn verify` pasan con Java 17 |
+| 3 | Push del commit `dfea70b` "test: violacion de arquitectura intencional" | **Rojo**: `procesamientoSinPersistenciaNiWeb` detecta `Field <ValidadorDuplicados.repositorio> has type <RepositorioSolicitudesJpa>` |
+| 4 | Push del revert `230e3fa` | Verde otra vez: 4 reglas sin fallos; en local `mvn verify` pasa con 49 pruebas |
+| 5 | Historial de GitHub Actions | ✅ #1 → ❌ #2 → ✅ #3 en `main` |
+
+![Repositorio en GitHub al cerrar la Parte 1](screenshots/p2/00-repositorio-github-parte1.png)
+![Reglas de arquitectura en local](screenshots/p2/01-reglas-arquitectura-4-pasan.png)
+![Pipeline en verde](screenshots/p2/02-actions-pipeline-verde.png)
+![Pipeline en rojo por la violación intencional](screenshots/p2/03-actions-violacion-roja.png)
+![Pipeline en verde tras el revert](screenshots/p2/04-actions-revert-verde.png)
+![Historial de GitHub Actions rojo y verde](screenshots/p2/05-actions-historial-rojo-verde.png)
+
+---
+
 ## Herramientas utilizadas
 
 - Java 17, Spring Boot 3.5.16 (Spring Web, Spring Data JPA, Validation), H2
-- JUnit 5, MockMvc, `OutputCaptureExtension`
-- Apache Maven, Git, GitHub, cURL (Git Bash), Visual Studio Code
+- JUnit 5, MockMvc, `OutputCaptureExtension`, ArchUnit 1.3.0
+- Apache Maven, Git, GitHub, GitHub Actions, cURL (Git Bash), Visual Studio Code
 
 ---
 
 ## Conclusiones
 
 La Parte 1 mostró que escribir el Diseño Propuesto antes del código obliga a encontrar el punto de variabilidad de cada requisito, y por eso cada patrón terminó respondiendo una pregunta distinta: la cadena decide si la solicitud entra, la estrategia cuánto se aprueba y los observadores a quién se avisa. Lo que más aportó fue probar el código de referencia en lugar de copiarlo, porque así aparecieron el tope de viaje que no contaba los días, los duplicados que solo miraban el mes y el dominio que no podía quedar libre de JPA. Lo que más costó fue decidir dónde vive cada regla sin agregar clases de más: el tope terminó en el dominio porque validador y calculadoras ya lo conocían, y el `orm.xml` evitó tanto el `@Entity` en el dominio como una entidad JPA aparte con su mapper, aunque fue la parte que más hubo que investigar.
+
+La Parte 2 mostró que la pregunta "¿capas o Hexagonal?" no tiene una sola respuesta para todo el sistema: para la persistencia no se cumple el criterio de la Guía, porque no hay cambio de motor y el dominio ya era puro, mientras que para la notificación sí hay un cambio con fecha, pero el puerto ya existía con otro nombre (`ObservadorCambioEstado`). Lo que más costó fue que las reglas de ArchUnit de la guía fallaran sin que hubiera ninguna violación real, y que la violación intencional tal como se describe (solo un `import`) no habría hecho fallar nada; entender por qué obligó a saber qué analiza realmente ArchUnit, que es el bytecode y no el texto del código. Con eso, el pipeline pasó de ser un paso del enunciado a una prueba de que los límites entre paquetes se cumplen.
+
+En general, el proyecto deja como aprendizaje que diseñar bien no es usar más patrones, sino poder justificar cada uno y también cada cosa que se dejó por fuera: tres patrones de comportamiento, cada uno con un requisito real detrás; una arquitectura en capas que se defiende con métricas en lugar de con preferencias; y cinco alternativas descartadas con la señal que las haría volver. El código de referencia sirvió como punto de partida, pero el valor estuvo en probarlo, encontrar dónde no cumplía lo que prometía y dejar cada corrección respaldada por una prueba.
